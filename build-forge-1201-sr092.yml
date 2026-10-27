@@ -1,0 +1,137 @@
+name: Wisteria Forge 1.20.1 + SR 0.9.2-alpha.2 (experimental)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - name: Checkout current Wisteria source
+        uses: actions/checkout@v4
+
+      - name: Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Download the exact SR 0.9.2-alpha.2 Forge 1.20.1 JAR
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, urllib.request
+          wanted = '1.20.1-0.9.2-alpha.2+gl-forge'
+          url = 'https://api.modrinth.com/v2/project/Hf3Qz2H3/version'
+          def get(url):
+              req = urllib.request.Request(url, headers={'User-Agent':'Wisteria-SR092-CI/0.1 (GitHub Actions)'})
+              return urllib.request.urlopen(req, timeout=60).read()
+          versions = json.loads(get(url))
+          candidates = [v for v in versions if v['version_number'] == wanted and 'forge' in v.get('loaders',[]) and '1.20.1' in v.get('game_versions',[])]
+          if len(candidates) != 1:
+              raise SystemExit(f'Cannot uniquely locate exact SR release {wanted}: {len(candidates)} matches')
+          files = candidates[0]['files']
+          file = next((f for f in files if f.get('primary') and f['filename'].endswith('.jar')), None)
+          if file is None:
+              file = next(f for f in files if f['filename'].endswith('.jar'))
+          data = get(file['url'])
+          sha1 = hashlib.sha1(data).hexdigest()
+          if sha1 != file['hashes']['sha1']:
+              raise SystemExit(f'SR JAR SHA1 mismatch: {sha1}')
+          out = pathlib.Path('sr_mod/super_resolution-forge-1.20.1-0.9.2-alpha.2+opengl.jar')
+          out.parent.mkdir(parents=True, exist_ok=True)
+          out.write_bytes(data)
+          print(f'Downloaded {file["filename"]}: {len(data)} bytes, SHA1 {sha1}')
+          PY
+
+      - name: Inspect SR class structure, patch Wisteria Gradle dependencies
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import zipfile
+          sr = Path('sr_mod/super_resolution-forge-1.20.1-0.9.2-alpha.2+opengl.jar')
+          with zipfile.ZipFile(sr) as z:
+              names = set(z.namelist())
+          expected = 'io/homo/superresolution/api/registry/framegeneration/FrameGenerationDescription.class'
+          found = sorted(n for n in names if n.endswith('/FrameGenerationDescription.class'))
+          print('SR FrameGenerationDescription class paths:', found)
+          Path('patch-info.txt').write_text('Found: '+repr(found)+'\n')
+          if expected not in names:
+              raise SystemExit('SR 0.9.2-alpha.2 has no expected new API class. Do not build an incompatible JAR; inspect the downloaded SR API first.')
+          root = Path('build.gradle.kts')
+          s = root.read_text(encoding='utf-8')
+          old = '"compileOnly"(superResolutionApi())'
+          if s.count(old) != 1:
+              raise SystemExit(f'Expected ONE Gradle API dependency line, got {s.count(old)}. Upstream sources changed.')
+          new = '''val sr092LocalJar = rootProject.file("sr_mod/super_resolution-forge-1.20.1-0.9.2-alpha.2+opengl.jar")
+              if (sr092LocalJar.isFile && versionId == "1.20.1") {
+                  "compileOnly"(files(sr092LocalJar))
+              } else {
+                  "compileOnly"(superResolutionApi())
+              }'''
+          s = s.replace(old, new, 1)
+          root.write_text(s, encoding='utf-8')
+
+          forge = Path('forge/build.gradle.kts')
+          s = forge.read_text(encoding='utf-8')
+          old = 'it.name.endsWith(".$variant.jar")'
+          if s.count(old) != 1:
+              raise SystemExit('Forge SR runtime jar matching code changed; inspect forge/build.gradle.kts.')
+          s = s.replace(old, '(it.name.endsWith(".$variant.jar") || it.name.endsWith("+$variant.jar"))', 1)
+          forge.write_text(s, encoding='utf-8')
+
+          props = Path('gradle.properties')
+          s = props.read_text(encoding='utf-8')
+          s = s.replace('sr_min_version=0.9.2-alpha.1','sr_min_version=0.9.2-alpha.2')
+          props.write_text(s, encoding='utf-8')
+          print('Patched to compile Wisteria directly against installed SR 0.9.2-alpha.2 Forge jar.')
+          PY
+
+      - name: Download official NVIDIA Streamline runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v2.12.0 -R NVIDIA-RTX/Streamline \
+            --pattern 'streamline-sdk-*.zip' --output /tmp/streamline-sdk.zip --clobber
+          mkdir -p streamline
+          unzip -q /tmp/streamline-sdk.zip 'bin/x64/*' -x 'bin/x64/development/*' -d streamline
+          test -f streamline/bin/x64/sl.interposer.dll
+          test -f streamline/bin/x64/nvngx_dlssg.dll
+
+      - name: Compile Forge 1.20.1 JAR
+        shell: bash
+        env:
+          ORG_GRADLE_PROJECT_streamline_bin_dir: ${{ github.workspace }}/streamline/bin/x64
+        run: |
+          set -o pipefail
+          chmod +x gradlew
+          ./gradlew :forge:build -Pmc=1.20.1 --refresh-dependencies --no-daemon --console=plain 2>&1 | tee build.log
+
+      - name: Upload compiled JAR (only when compilation succeeded)
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: Wisteria-FORGE-1.20.1-SR-0.9.2-alpha.2-EXPERIMENTAL
+          path: forge/build/libs/*.jar
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload diagnostic files
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-diagnostics
+          path: |
+            build.log
+            patch-info.txt
+          if-no-files-found: warn
+          retention-days: 7
