@@ -114,7 +114,7 @@ jobs:
         run: |
           set -o pipefail
           chmod +x gradlew
-          ./gradlew :forge:build -Pmc=1.20.1 --refresh-dependencies --no-daemon --console=plain 2>&1 | tee build.log
+          ./gradlew :forge:assemble -Pmc=1.20.1 --refresh-dependencies --no-daemon --console=plain 2>&1 | tee build.log
 
       - name: Upload compiled JAR (only when compilation succeeded)
         uses: actions/upload-artifact@v4
